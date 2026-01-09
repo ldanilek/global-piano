@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@tonejs/piano": "^0.2.1",
     "convex": "^1.31.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
