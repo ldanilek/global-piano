@@ -39,7 +39,8 @@ A web-based piano built with Convex + Vite featuring the three middle octaves (C
 - **Click** or **tap** piano keys to play notes
 - White keys: C, D, E, F, G, A, B
 - Black keys: C♯, D♯, F♯, G♯, A♯
-- Notes are recorded to Convex and synced globally
+- Notes are synced via Convex: each pointer hold is tracked so multiple players on the same key work correctly; drag across keys to glide
+- **Debug:** `?debugPiano=1` or `localStorage.debugPiano = "1"` — extra console logs for keydown/keyup and Convex sync (no UI change)
 
 ## Project Structure
 
@@ -51,8 +52,8 @@ src/
   main.tsx        # Entry point with ConvexProvider
 
 convex/
-  schema.ts       # Database schema (notePlays table)
-  piano.ts        # Mutations: playNote, Queries: getRecentPlays
+  schema.ts       # noteHolds, sessionActivity, pianoEventLog
+  piano.ts        # holds + listEventLog (append-only audit)
 ```
 
 ## Scripts
