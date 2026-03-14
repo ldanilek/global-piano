@@ -4,6 +4,22 @@ import { v } from "convex/values";
 
 const STALE_SESSION_MS = 2 * 60 * 1000;
 
+/** Single-codepoint / common emoji picks only — server validates so clients can't send arbitrary strings */
+const SESSION_EMOJI_ALLOWLIST = new Set([
+  "🎹", "🎵", "🎶", "🎤", "🎧", "🎸", "🎺", "🎻", "🥁", "🎷",
+  "🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐸", "🦄", "🐝", "🦋",
+  "⭐", "🌙", "☀️", "🌈", "🔥", "💧", "🌊", "🍀", "🌸", "🍄",
+  "🎮", "🚀", "✨", "💫", "❤️", "💜", "💙", "💚", "🧡", "🤍",
+  "🎪", "🎭", "🎨", "🍕", "🍦", "☕", "🌮", "🍎", "🐙", "🦀",
+  "👽", "🤖", "💎", "⚡", "🎲", "🏀", "⚽", "🎯", "📌", "🔔",
+]);
+
+function assertAllowedEmoji(emoji: string): void {
+  if (!SESSION_EMOJI_ALLOWLIST.has(emoji)) {
+    throw new Error("Pick an emoji from the list");
+  }
+}
+
 async function logEvent(
   ctx: MutationCtx,
   row: {
@@ -38,6 +54,13 @@ async function cleanupStaleSessions(ctx: MutationCtx): Promise<void> {
         note: h.note,
       });
       await ctx.db.delete(h._id);
+    }
+    const profile = await ctx.db
+      .query("sessionProfiles")
+      .withIndex("by_session", (q) => q.eq("sessionId", row.sessionId))
+      .unique();
+    if (profile) {
+      await ctx.db.delete(profile._id);
     }
     await ctx.db.delete(row._id);
   }
@@ -75,6 +98,30 @@ async function sessionHolds(ctx: MutationCtx, sessionId: string) {
     .withIndex("by_session_pointer", (q) => q.eq("sessionId", sessionId))
     .collect();
 }
+
+export const setSessionProfile = mutation({
+  args: {
+    sessionId: v.string(),
+    emoji: v.string(),
+  },
+  handler: async (ctx, args) => {
+    assertAllowedEmoji(args.emoji);
+    await cleanupStaleSessions(ctx);
+    const existing = await ctx.db
+      .query("sessionProfiles")
+      .withIndex("by_session", (q) => q.eq("sessionId", args.sessionId))
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, { emoji: args.emoji });
+    } else {
+      await ctx.db.insert("sessionProfiles", {
+        sessionId: args.sessionId,
+        emoji: args.emoji,
+      });
+    }
+    await touchSession(ctx, args.sessionId);
+  },
+});
 
 /**
  * Replace all keyboard holds (pointerId key_*) for this session in one transaction.
@@ -244,6 +291,23 @@ export const getHolds = query({
   args: {},
   handler: async (ctx) => {
     return await ctx.db.query("noteHolds").collect();
+  },
+});
+
+export const getPianoState = query({
+  args: {},
+  handler: async (ctx) => {
+    const holds = await ctx.db.query("noteHolds").collect();
+    const sessionIds = [...new Set(holds.map((h) => h.sessionId))];
+    const emojiBySession: Record<string, string> = {};
+    for (const sid of sessionIds) {
+      const p = await ctx.db
+        .query("sessionProfiles")
+        .withIndex("by_session", (q) => q.eq("sessionId", sid))
+        .unique();
+      emojiBySession[sid] = p?.emoji ?? "🎹";
+    }
+    return { holds, emojiBySession };
   },
 });
 

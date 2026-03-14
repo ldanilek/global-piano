@@ -15,6 +15,12 @@ export default defineSchema({
     .index("by_session", ["sessionId"])
     .index("by_lastActive", ["lastActive"]),
 
+  /** One row per session: emoji shown on keys they hold */
+  sessionProfiles: defineTable({
+    sessionId: v.string(),
+    emoji: v.string(),
+  }).index("by_session", ["sessionId"]),
+
   /**
    * Append-only log of every press / release / glide move (for analytics & debugging).
    */
