@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useState } from "react";
+import { flushSync } from "react-dom";
 import * as Tone from "tone";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "../../convex/_generated/api";
@@ -27,6 +28,57 @@ function generateSessionId(): string {
   return `session_${Math.random().toString(36).slice(2, 11)}_${Date.now()}`;
 }
 
+function getOrCreatePersistedSessionId(): string {
+  const k = "pianoSessionId";
+  if (typeof sessionStorage === "undefined") {
+    return generateSessionId();
+  }
+  const existing = sessionStorage.getItem(k);
+  if (existing !== null && existing.length > 0) {
+    return existing;
+  }
+  const id = generateSessionId();
+  sessionStorage.setItem(k, id);
+  return id;
+}
+
+/** Must match allowlist in convex/piano.ts */
+const SESSION_EMOJI_CHOICES = [
+  "🎹", "🎵", "🎶", "🎤", "🎧", "🎸", "🎺", "🎻", "🥁", "🎷",
+  "🐱", "🐶", "🦊", "🐻", "🐼", "🦁", "🐸", "🦄", "🐝", "🦋",
+  "⭐", "🌙", "☀️", "🌈", "🔥", "💧", "🌊", "🍀", "🌸", "🍄",
+  "🎮", "🚀", "✨", "💫", "❤️", "💜", "💙", "💚", "🧡", "🤍",
+  "🎪", "🎭", "🎨", "🍕", "🍦", "☕", "🌮", "🍎", "🐙", "🦀",
+  "👽", "🤖", "💎", "⚡", "🎲", "🏀", "⚽", "🎯", "📌", "🔔",
+] as const;
+
+function pickRandomSessionEmoji(): string {
+  const i = Math.floor(Math.random() * SESSION_EMOJI_CHOICES.length);
+  return SESSION_EMOJI_CHOICES[i] ?? "🎹";
+}
+
+/** My emoji only while I’m physically holding (local input). Others from Convex holds. */
+function keyEmojiLayers(
+  note: string,
+  holds: { sessionId: string; note: string }[],
+  emojiBySession: Record<string, string>,
+  mySessionId: string,
+  localCountOnNote: number
+): { showMine: boolean; remotes: { sid: string; emoji: string }[] } {
+  const showMine = localCountOnNote > 0;
+  const remotes: { sid: string; emoji: string }[] = [];
+  const seen = new Set<string>();
+  for (const h of holds) {
+    if (h.note !== note) continue;
+    if (sameSession(h.sessionId, mySessionId)) continue;
+    if (seen.has(h.sessionId)) continue;
+    seen.add(h.sessionId);
+    remotes.push({ sid: h.sessionId, emoji: emojiBySession[h.sessionId] ?? "🎹" });
+  }
+  remotes.sort((a, b) => a.sid.localeCompare(b.sid));
+  return { showMine, remotes };
+}
+
 function noteFromPoint(clientX: number, clientY: number): string | null {
   const el = document.elementFromPoint(clientX, clientY);
   let e: Element | null = el;
@@ -42,11 +94,6 @@ function pointerKey(id: number): string {
   return `p_${id}`;
 }
 
-/**
- * Spatial piano ↔ QWERTY: home row = whites; row above = blacks set back‑left
- * between the same white pairs as on a real keyboard (e.g. R above/between D–F
- * = G#3 between G3 and A3, diagonal from F = A3).
- */
 const CODE_TO_NOTE: Record<string, string> = {
   KeyZ: "C3",
   KeyX: "D3",
@@ -76,15 +123,15 @@ function keyboardPointerId(code: string): string {
   return `key_${code}`;
 }
 
-function pidToKeyCode(pid: string): string {
-  return pid.startsWith("key_") ? pid.slice(4) : pid;
-}
-
 function isTypingTarget(el: EventTarget | null): boolean {
   if (el === null || !(el instanceof HTMLElement)) return false;
   const t = el.tagName;
   if (t === "INPUT" || t === "TEXTAREA" || t === "SELECT") return true;
   return el.isContentEditable;
+}
+
+function sameSession(a: string, b: string): boolean {
+  return String(a) === String(b);
 }
 
 function remoteNoteCounts(
@@ -93,8 +140,16 @@ function remoteNoteCounts(
 ): Map<string, number> {
   const m = new Map<string, number>();
   for (const h of holds) {
-    if (h.sessionId === mySession) continue;
+    if (sameSession(h.sessionId, mySession)) continue;
     m.set(h.note, (m.get(h.note) ?? 0) + 1);
+  }
+  return m;
+}
+
+function localNoteCounts(pointers: Map<string, string>): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const note of pointers.values()) {
+    m.set(note, (m.get(note) ?? 0) + 1);
   }
   return m;
 }
@@ -113,20 +168,14 @@ function mergeActiveKeys(
   return s;
 }
 
-/** `?debugPiano=1` or `localStorage.debugPiano = "1"` */
-function pianoDebug(): boolean {
-  if (typeof window === "undefined") return false;
-  return (
-    new URLSearchParams(window.location.search).has("debugPiano") ||
-    window.localStorage.getItem("debugPiano") === "1"
-  );
+function keyboardHoldsPayload(pointers: Map<string, string>) {
+  return [...pointers.entries()]
+    .filter(([pid]) => pid.startsWith("key_"))
+    .map(([pointerId, note]) => ({ pointerId, note }));
 }
 
-function pianoLog(...args: unknown[]): void {
-  if (pianoDebug()) {
-    console.log("[piano]", ...args);
-  }
-}
+/** Previous remote note counts for audio diff (survives effect re-runs; reset when synth disposes) */
+let pianoLastRemoteCounts: Map<string, number> | undefined;
 
 function makePoly(): Tone.PolySynth<Tone.Synth> {
   return new Tone.PolySynth({
@@ -145,133 +194,74 @@ function makePoly(): Tone.PolySynth<Tone.Synth> {
 }
 
 export function Piano() {
-  /** Direct input (mouse / keyboard) — never share with remote logic */
-  const localSynthRef = useRef<Tone.PolySynth<Tone.Synth> | null>(null);
-  /** Other sessions only — so remote release never cuts a note you still hold */
-  const remoteSynthRef = useRef<Tone.PolySynth<Tone.Synth> | null>(null);
-  const sessionIdRef = useRef<string>(generateSessionId());
-  const remoteInitRef = useRef(false);
-  const prevRemoteCountsRef = useRef<Map<string, number>>(new Map());
-  /** Per pointerId: current note held locally */
-  const pointerNotesRef = useRef<Map<string, string>>(new Map());
-  /** Local ref count per note (multiple pointers can hold same note) */
-  const localNoteCountsRef = useRef<Map<string, number>>(new Map());
-
-  const [activeKeys, setActiveKeys] = useState<Set<string>>(new Set());
+  const [sessionId] = useState(() => getOrCreatePersistedSessionId());
+  /** pointerId → note (mouse + keyboard) */
+  const [localPointers, setLocalPointers] = useState<Map<string, string>>(() => new Map());
+  const [synthPair, setSynthPair] = useState<{
+    local: Tone.PolySynth<Tone.Synth>;
+    remote: Tone.PolySynth<Tone.Synth>;
+  } | null>(null);
+  const [myEmoji, setMyEmoji] = useState(pickRandomSessionEmoji);
+  const [emojiPickerOpen, setEmojiPickerOpen] = useState(false);
 
   const pressNoteMutation = useMutation(api.piano.pressNote);
   const releasePointerMutation = useMutation(api.piano.releasePointer);
   const moveNoteMutation = useMutation(api.piano.moveNote);
   const syncKeyboardHoldsMutation = useMutation(api.piano.syncKeyboardHolds);
-  const holds = useQuery(api.piano.getHolds);
-  const holdsRef = useRef(holds);
-  holdsRef.current = holds;
+  const setSessionProfileMutation = useMutation(api.piano.setSessionProfile);
+  const pianoState = useQuery(api.piano.getPianoState);
+  const holds = pianoState?.holds;
+  const emojiBySession = pianoState?.emojiBySession ?? {};
+  const holdsList = holds ?? [];
 
-  /** One Convex sync shortly after the last keyboard change — avoids racy partial snapshots. */
-  const keyboardConvexDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const scheduleKeyboardConvexSync = useCallback(() => {
-    if (keyboardConvexDebounceRef.current !== null) {
-      clearTimeout(keyboardConvexDebounceRef.current);
-    }
-    keyboardConvexDebounceRef.current = setTimeout(() => {
-      keyboardConvexDebounceRef.current = null;
-      const holdsPayload = [...pointerNotesRef.current.entries()]
-        .filter(([pid]) => pid.startsWith("key_"))
-        .map(([pointerId, note]) => ({ pointerId, note }));
-      pianoLog(
-        "syncKeyboard convex",
-        holdsPayload.length,
-        holdsPayload.map((x) => x.pointerId)
-      );
-      void syncKeyboardHoldsMutation({
-        sessionId: sessionIdRef.current,
-        holds: holdsPayload,
-      })
-        .then(() => pianoLog("syncKeyboard ok", holdsPayload.length))
-        .catch((err: unknown) => {
-          console.error("[piano] syncKeyboard failed", err);
-          throw err;
-        });
-    }, 35);
-  }, [syncKeyboardHoldsMutation]);
-
-  const flushKeyboardConvexNow = useCallback(() => {
-    if (keyboardConvexDebounceRef.current !== null) {
-      clearTimeout(keyboardConvexDebounceRef.current);
-      keyboardConvexDebounceRef.current = null;
-    }
-    const holdsPayload = [...pointerNotesRef.current.entries()]
-      .filter(([pid]) => pid.startsWith("key_"))
-      .map(([pointerId, note]) => ({ pointerId, note }));
-    void syncKeyboardHoldsMutation({
-      sessionId: sessionIdRef.current,
-      holds: holdsPayload,
-    }).catch((err: unknown) => {
-      console.error("[piano] syncKeyboard failed", err);
-      throw err;
-    });
-  }, [syncKeyboardHoldsMutation]);
-
-  useEffect(
-    () => () => {
-      if (keyboardConvexDebounceRef.current !== null) {
-        clearTimeout(keyboardConvexDebounceRef.current);
-      }
-    },
-    []
-  );
-
-  const bumpLocalNote = useCallback((note: string, delta: number) => {
-    const m = localNoteCountsRef.current;
-    const next = (m.get(note) ?? 0) + delta;
-    if (next <= 0) m.delete(note);
-    else m.set(note, next);
-  }, []);
-
-  const recomputeActiveKeys = useCallback(
-    (remote: Map<string, number>) => {
-      setActiveKeys(mergeActiveKeys(localNoteCountsRef.current, remote));
-    },
-    []
-  );
+  const localCounts = localNoteCounts(localPointers);
+  const remoteCounts =
+    holds !== undefined ? remoteNoteCounts(holds, sessionId) : new Map<string, number>();
+  const activeKeys = mergeActiveKeys(localCounts, remoteCounts);
 
   useLayoutEffect(() => {
     const local = makePoly();
     const remote = makePoly();
-    localSynthRef.current = local;
-    remoteSynthRef.current = remote;
-
+    /* Tone must be created here so Strict Mode’s effect cleanup→re-run replaces disposed synths */
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- sync external audio nodes to React tree
+    setSynthPair({ local, remote });
     return () => {
+      pianoLastRemoteCounts = undefined;
       local.dispose();
       remote.dispose();
-      localSynthRef.current = null;
-      remoteSynthRef.current = null;
     };
   }, []);
 
-  const sessionId = sessionIdRef.current;
+  useEffect(() => {
+    void setSessionProfileMutation({ sessionId, emoji: myEmoji });
+  }, [setSessionProfileMutation, myEmoji, sessionId]);
 
   useEffect(() => {
-    if (!holds || !remoteSynthRef.current) return;
+    if (!emojiPickerOpen) return;
+    const close = () => setEmojiPickerOpen(false);
+    const id = requestAnimationFrame(() => {
+      document.addEventListener("click", close);
+    });
+    return () => {
+      cancelAnimationFrame(id);
+      document.removeEventListener("click", close);
+    };
+  }, [emojiPickerOpen]);
 
+  /** Remote-only audio: diff remote counts when Convex holds change */
+  useEffect(() => {
+    if (holds === undefined || synthPair === null) return;
+    const remoteSynth = synthPair.remote;
     const counts = remoteNoteCounts(holds, sessionId);
-    const remoteSynth = remoteSynthRef.current;
-
-    if (!remoteInitRef.current) {
-      remoteInitRef.current = true;
-      prevRemoteCountsRef.current = new Map(counts);
-      recomputeActiveKeys(counts);
+    const prev = pianoLastRemoteCounts;
+    if (prev === undefined) {
+      pianoLastRemoteCounts = new Map(counts);
       return;
     }
-
-    const prev = prevRemoteCountsRef.current;
     const allNotes = new Set([...prev.keys(), ...counts.keys()]);
-
     if (Tone.context.state !== "running") {
-      Tone.start();
+      void Tone.start();
     }
-
     for (const note of allNotes) {
       const a = prev.get(note) ?? 0;
       const b = counts.get(note) ?? 0;
@@ -281,125 +271,74 @@ export function Piano() {
         remoteSynth.triggerRelease(note);
       }
     }
+    pianoLastRemoteCounts = new Map(counts);
+  }, [holds, sessionId, synthPair]);
 
-    prevRemoteCountsRef.current = new Map(counts);
-    recomputeActiveKeys(counts);
-  }, [holds, sessionId, recomputeActiveKeys]);
-
-  const localPress = useCallback(
-    (note: string, pid: string) => {
-      if (!localSynthRef.current) {
-        pianoLog("localPress skip: no synth", pid, note);
-        return;
-      }
-      if (Tone.context.state !== "running") {
-        Tone.start();
-      }
-      localSynthRef.current.triggerAttack(note, undefined, 0.7);
-      pointerNotesRef.current.set(pid, note);
-      bumpLocalNote(note, 1);
-      const h = holdsRef.current;
-      const remote = h ? remoteNoteCounts(h, sessionId) : new Map();
-      recomputeActiveKeys(remote);
-      pianoLog("keydown→press", pidToKeyCode(pid), note, "pointers", pointerNotesRef.current.size);
-      if (pid.startsWith("key_")) {
-        scheduleKeyboardConvexSync();
-      } else {
-        void pressNoteMutation({
-          note,
-          sessionId: sessionIdRef.current,
-          pointerId: pid,
-        }).then(() => {
-          pianoLog("convex press ok", pid, note);
-        }).catch((err: unknown) => {
-          console.error("[piano] convex press failed", pid, note, err);
-          throw err;
-        });
-      }
-    },
-    [pressNoteMutation, bumpLocalNote, recomputeActiveKeys, sessionId, scheduleKeyboardConvexSync]
-  );
-
-  const localReleasePointer = useCallback(
-    (pid: string) => {
-      if (!localSynthRef.current) {
-        pianoLog("localRelease skip: no synth", pid);
-        return;
-      }
-      const note = pointerNotesRef.current.get(pid);
-      if (note === undefined) {
-        pianoLog("keyup ignored (no prior press)", pidToKeyCode(pid));
-        return;
-      }
-      pointerNotesRef.current.delete(pid);
-      localSynthRef.current.triggerRelease(note);
-      bumpLocalNote(note, -1);
-      const h = holdsRef.current;
-      const remote = h ? remoteNoteCounts(h, sessionId) : new Map();
-      recomputeActiveKeys(remote);
-      pianoLog("keyup→release", pidToKeyCode(pid), note, "pointers", pointerNotesRef.current.size);
-      if (pid.startsWith("key_")) {
-        scheduleKeyboardConvexSync();
-      } else {
-        void releasePointerMutation({
-          sessionId: sessionIdRef.current,
-          pointerId: pid,
-        }).then(() => {
-          pianoLog("convex release ok", pid);
-        }).catch((err: unknown) => {
-          console.error("[piano] convex release failed", pid, err);
-          throw err;
-        });
-      }
-    },
-    [releasePointerMutation, bumpLocalNote, recomputeActiveKeys, sessionId, scheduleKeyboardConvexSync]
-  );
-
-  const localMove = useCallback(
-    (pid: string, fromNote: string, toNote: string) => {
-      if (!localSynthRef.current) return;
-      localSynthRef.current.triggerRelease(fromNote);
-      localSynthRef.current.triggerAttack(toNote, undefined, 0.7);
-      bumpLocalNote(fromNote, -1);
-      bumpLocalNote(toNote, 1);
-      pointerNotesRef.current.set(pid, toNote);
-      const h = holdsRef.current;
-      const remote = h ? remoteNoteCounts(h, sessionId) : new Map();
-      recomputeActiveKeys(remote);
-      void moveNoteMutation({
-        sessionId: sessionIdRef.current,
-        pointerId: pid,
-        fromNote,
-        toNote,
+  const syncKeyboardToConvex = useCallback(
+    (next: Map<string, string>) => {
+      void syncKeyboardHoldsMutation({
+        sessionId,
+        holds: keyboardHoldsPayload(next),
       }).catch((err: unknown) => {
-        console.error("[piano] convex move failed", err);
+        console.error("[piano] syncKeyboard failed", err);
         throw err;
       });
     },
-    [moveNoteMutation, bumpLocalNote, recomputeActiveKeys, sessionId]
+    [syncKeyboardHoldsMutation, sessionId]
   );
 
   useEffect(() => {
+    if (synthPair === null) return;
+    const { local: localSynth } = synthPair;
     const onMove = (e: PointerEvent) => {
       const pid = pointerKey(e.pointerId);
-      const current = pointerNotesRef.current.get(pid);
-      if (current === undefined) return;
-
-      const under = noteFromPoint(e.clientX, e.clientY);
-      if (under === null) {
-        localReleasePointer(pid);
-        return;
-      }
-      if (under !== current) {
-        localMove(pid, current, under);
-      }
+      setLocalPointers((prev) => {
+        const current = prev.get(pid);
+        if (current === undefined) return prev;
+        const under = noteFromPoint(e.clientX, e.clientY);
+        if (under === null) {
+          localSynth.triggerRelease(current);
+          const next = new Map(prev);
+          next.delete(pid);
+          void releasePointerMutation({ sessionId, pointerId: pid }).catch((err: unknown) => {
+            console.error("[piano] convex release failed", err);
+            throw err;
+          });
+          return next;
+        }
+        if (under !== current) {
+          localSynth.triggerRelease(current);
+          localSynth.triggerAttack(under, undefined, 0.7);
+          void moveNoteMutation({
+            sessionId,
+            pointerId: pid,
+            fromNote: current,
+            toNote: under,
+          }).catch((err: unknown) => {
+            console.error("[piano] convex move failed", err);
+            throw err;
+          });
+          return new Map(prev).set(pid, under);
+        }
+        return prev;
+      });
     };
 
     const onUp = (e: PointerEvent) => {
       const pid = pointerKey(e.pointerId);
-      if (pointerNotesRef.current.has(pid)) {
-        localReleasePointer(pid);
-      }
+      setLocalPointers((prev) => {
+        if (!prev.has(pid)) return prev;
+        const note = prev.get(pid);
+        if (note === undefined) return prev;
+        localSynth.triggerRelease(note);
+        const next = new Map(prev);
+        next.delete(pid);
+        void releasePointerMutation({ sessionId, pointerId: pid }).catch((err: unknown) => {
+          console.error("[piano] convex release failed", err);
+          throw err;
+        });
+        return next;
+      });
     };
 
     window.addEventListener("pointermove", onMove);
@@ -410,53 +349,61 @@ export function Piano() {
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
     };
-  }, [localReleasePointer, localMove]);
+  }, [releasePointerMutation, sessionId, moveNoteMutation, synthPair]);
 
   useEffect(() => {
+    if (synthPair === null) return;
+    const { local: localSynth } = synthPair;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.repeat) {
-        pianoLog("keydown skip repeat", e.code);
-        return;
-      }
-      if (isTypingTarget(e.target)) {
-        pianoLog("keydown skip typing target", e.code, (e.target as HTMLElement).tagName);
-        return;
-      }
+      if (e.repeat) return;
+      if (isTypingTarget(e.target)) return;
       const note = CODE_TO_NOTE[e.code];
       if (note === undefined) return;
       e.preventDefault();
       const pid = keyboardPointerId(e.code);
-      if (pointerNotesRef.current.has(pid)) {
-        pianoLog("keydown skip already tracked", e.code, note);
-        return;
-      }
-      localPress(note, pid);
+      setLocalPointers((prev) => {
+        if (prev.has(pid)) return prev;
+        if (Tone.context.state !== "running") {
+          void Tone.start();
+        }
+        localSynth.triggerAttack(note, undefined, 0.7);
+        const next = new Map(prev).set(pid, note);
+        syncKeyboardToConvex(next);
+        return next;
+      });
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
       const note = CODE_TO_NOTE[e.code];
       if (note === undefined) return;
       e.preventDefault();
-      localReleasePointer(keyboardPointerId(e.code));
+      const pid = keyboardPointerId(e.code);
+      setLocalPointers((prev) => {
+        if (!prev.has(pid)) return prev;
+        const n = prev.get(pid);
+        if (n === undefined) return prev;
+        localSynth.triggerRelease(n);
+        const next = new Map(prev);
+        next.delete(pid);
+        syncKeyboardToConvex(next);
+        return next;
+      });
     };
 
-    /** Only when the tab is hidden — not window `blur` (blur fires when focus moves to DevTools, iframes, or IDE UI and was wiping chords). */
     const onVisibilityChange = () => {
       if (!document.hidden) return;
-      pianoLog("tab hidden → release all keyboard");
-      const synth = localSynthRef.current;
-      if (!synth) return;
-      for (const id of [...pointerNotesRef.current.keys()]) {
-        if (!id.startsWith("key_")) continue;
-        const n = pointerNotesRef.current.get(id);
-        if (n === undefined) continue;
-        pointerNotesRef.current.delete(id);
-        synth.triggerRelease(n);
-        bumpLocalNote(n, -1);
-      }
-      const h = holdsRef.current;
-      recomputeActiveKeys(h ? remoteNoteCounts(h, sessionId) : new Map());
-      flushKeyboardConvexNow();
+      setLocalPointers((prev) => {
+        const next = new Map(prev);
+        for (const [id, n] of prev) {
+          if (!id.startsWith("key_")) continue;
+          localSynth.triggerRelease(n);
+          next.delete(id);
+        }
+        if (next.size !== prev.size) {
+          syncKeyboardToConvex(next);
+        }
+        return next;
+      });
     };
 
     const opts = { capture: true };
@@ -468,18 +415,12 @@ export function Piano() {
       window.removeEventListener("keyup", onKeyUp, opts);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [
-    localPress,
-    localReleasePointer,
-    flushKeyboardConvexNow,
-    bumpLocalNote,
-    recomputeActiveKeys,
-    sessionId,
-  ]);
+  }, [sessionId, synthPair, syncKeyboardToConvex]);
 
   const onPointerDown = useCallback(
     (note: string, e: React.PointerEvent) => {
       e.preventDefault();
+      if (synthPair === null) return;
       if (
         document.activeElement instanceof HTMLElement &&
         document.activeElement.closest(".piano")
@@ -487,11 +428,36 @@ export function Piano() {
         document.activeElement.blur();
       }
       const pid = pointerKey(e.pointerId);
-      if (pointerNotesRef.current.has(pid)) return;
-      localPress(note, pid);
+      const { local: localSynth } = synthPair;
+      let began = false;
+      flushSync(() => {
+        setLocalPointers((prev) => {
+          if (prev.has(pid)) return prev;
+          began = true;
+          return new Map(prev).set(pid, note);
+        });
+      });
+      if (!began) return;
+      if (Tone.context.state !== "running") {
+        void Tone.start();
+      }
+      localSynth.triggerAttack(note, undefined, 0.7);
+      void pressNoteMutation({ note, sessionId, pointerId: pid }).catch((err: unknown) => {
+        console.error("[piano] convex press failed", err);
+        throw err;
+      });
     },
-    [localPress]
+    [pressNoteMutation, sessionId, synthPair]
   );
+
+  if (synthPair === null) {
+    return (
+      <div className="piano-container">
+        <h1 className="piano-title">Global Piano</h1>
+        <p className="piano-subtitle">Loading audio…</p>
+      </div>
+    );
+  }
 
   return (
     <div className="piano-container">
@@ -500,34 +466,128 @@ export function Piano() {
         Three middle octaves (C3–B5) · Everyone plays the same piano
       </p>
 
+      <div className="piano-session-bar">
+        <span className="piano-session-label">You</span>
+        <button
+          type="button"
+          className="piano-session-emoji-btn"
+          aria-label={emojiPickerOpen ? "Close emoji picker" : "Choose your emoji"}
+          aria-expanded={emojiPickerOpen}
+          onClick={(e) => {
+            e.stopPropagation();
+            setEmojiPickerOpen((o) => !o);
+          }}
+        >
+          {myEmoji}
+        </button>
+        {emojiPickerOpen ? (
+          <div
+            className="piano-emoji-picker"
+            role="listbox"
+            aria-label="Session emoji"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {SESSION_EMOJI_CHOICES.map((em) => (
+              <button
+                key={em}
+                type="button"
+                role="option"
+                aria-selected={em === myEmoji}
+                className={`piano-emoji-option ${em === myEmoji ? "piano-emoji-option-current" : ""}`}
+                onClick={() => {
+                  setMyEmoji(em);
+                  setEmojiPickerOpen(false);
+                }}
+              >
+                {em}
+              </button>
+            ))}
+          </div>
+        ) : null}
+      </div>
+
       <div className="piano">
         <div className="piano-keys piano-keys-white">
-          {WHITE_KEYS.map((note) => (
-            <button
-              key={note}
-              type="button"
-              data-note={note}
-              className={`piano-key piano-key-white ${activeKeys.has(note) ? "active" : ""}`}
-              onPointerDown={(e) => onPointerDown(note, e)}
-            >
-              <span className="piano-key-label">{note}</span>
-            </button>
-          ))}
+          {WHITE_KEYS.map((note) => {
+            const lc = localCounts.get(note) ?? 0;
+            const layers = keyEmojiLayers(
+              note,
+              holdsList,
+              emojiBySession,
+              sessionId,
+              lc
+            );
+            const anyEmoji = layers.showMine || layers.remotes.length > 0;
+            return (
+              <div key={note} className="piano-white-key-cell">
+                <div className="piano-key-emojis" aria-hidden={!anyEmoji}>
+                  <span className="piano-key-emojis-inner">
+                    {layers.showMine ? (
+                      <span className="piano-key-emoji piano-key-emoji-mine">{myEmoji}</span>
+                    ) : null}
+                    {layers.remotes.map((r) => (
+                      <span key={r.sid} className="piano-key-emoji">
+                        {r.emoji}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  data-note={note}
+                  className={`piano-key piano-key-white ${activeKeys.has(note) ? "active" : ""}`}
+                  onPointerDown={(e) => onPointerDown(note, e)}
+                >
+                  <span className="piano-key-label">{note}</span>
+                </button>
+              </div>
+            );
+          })}
         </div>
 
         <div className="piano-keys piano-keys-black">
-          {BLACK_KEYS.map(({ note, whiteKeyIndex }) => (
-            <button
-              key={note}
-              type="button"
-              data-note={note}
-              className={`piano-key piano-key-black ${activeKeys.has(note) ? "active" : ""}`}
-              style={{ left: `calc(${(whiteKeyIndex / 21) * 100}% + 2.2%)` }}
-              onPointerDown={(e) => onPointerDown(note, e)}
-            >
-              <span className="piano-key-label">{note.replace("#", "♯")}</span>
-            </button>
-          ))}
+          {BLACK_KEYS.map(({ note, whiteKeyIndex }) => {
+            const lc = localCounts.get(note) ?? 0;
+            const layers = keyEmojiLayers(
+              note,
+              holdsList,
+              emojiBySession,
+              sessionId,
+              lc
+            );
+            const anyEmoji = layers.showMine || layers.remotes.length > 0;
+            return (
+              <div
+                key={note}
+                className="piano-key-black-cell"
+                style={{
+                  left: `calc(${(whiteKeyIndex / 21) * 100}% + 2.2%)`,
+                  width: "calc(100% / 21 * 0.6)",
+                }}
+              >
+                <div className="piano-key-emojis piano-key-emojis-black" aria-hidden={!anyEmoji}>
+                  <span className="piano-key-emojis-inner">
+                    {layers.showMine ? (
+                      <span className="piano-key-emoji piano-key-emoji-mine">{myEmoji}</span>
+                    ) : null}
+                    {layers.remotes.map((r) => (
+                      <span key={r.sid} className="piano-key-emoji">
+                        {r.emoji}
+                      </span>
+                    ))}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  data-note={note}
+                  className={`piano-key piano-key-black ${activeKeys.has(note) ? "active" : ""}`}
+                  onPointerDown={(e) => onPointerDown(note, e)}
+                >
+                  <span className="piano-key-label">{note.replace("#", "♯")}</span>
+                </button>
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>

@@ -40,6 +40,7 @@ A web-based piano built with Convex + Vite featuring the three middle octaves (C
 - White keys: C, D, E, F, G, A, B
 - Black keys: C♯, D♯, F♯, G♯, A♯
 - Notes are synced via Convex: each pointer hold is tracked so multiple players on the same key work correctly; drag across keys to glide
+- Each browser session gets a random emoji (change via **You**); held keys show which players are on that note
 - **Debug:** `?debugPiano=1` or `localStorage.debugPiano = "1"` — extra console logs for keydown/keyup and Convex sync (no UI change)
 
 ## Project Structure
