@@ -11,7 +11,9 @@ export default defineSchema({
   sessionActivity: defineTable({
     sessionId: v.string(),
     lastActive: v.number(),
-  }).index("by_session", ["sessionId"]),
+  })
+    .index("by_session", ["sessionId"])
+    .index("by_lastActive", ["lastActive"]),
 
   /**
    * Append-only log of every press / release / glide move (for analytics & debugging).

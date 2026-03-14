@@ -25,7 +25,7 @@ async function cleanupStaleSessions(ctx: MutationCtx): Promise<void> {
   const cutoff = Date.now() - STALE_SESSION_MS;
   const stale = await ctx.db
     .query("sessionActivity")
-    .filter((q) => q.lt(q.field("lastActive"), cutoff))
+    .withIndex("by_lastActive", (q) => q.lt("lastActive", cutoff))
     .collect();
 
   for (const row of stale) {
